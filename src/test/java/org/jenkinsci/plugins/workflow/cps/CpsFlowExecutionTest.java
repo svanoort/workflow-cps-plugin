@@ -34,6 +34,10 @@ import hudson.AbortException;
 import hudson.model.Item;
 import hudson.model.Result;
 import hudson.model.TaskListener;
+
+import java.lang.management.ClassLoadingMXBean;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryPoolMXBean;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -49,6 +53,9 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.CheckForNull;
+
+import hudson.tasks.LogRotator;
+import jenkins.model.BuildDiscarder;
 import jenkins.model.Jenkins;
 import org.codehaus.groovy.reflection.ClassInfo;
 import org.codehaus.groovy.transform.ASTTransformationVisitor;
@@ -65,6 +72,8 @@ import org.jenkinsci.plugins.workflow.support.pickles.SingleTypedPickleFactory;
 import org.jenkinsci.plugins.workflow.support.pickles.TryRepeatedly;
 import org.jenkinsci.plugins.workflow.test.steps.SemaphoreStep;
 import static org.junit.Assert.*;
+
+import org.junit.Assert;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
@@ -90,6 +99,7 @@ public class CpsFlowExecutionTest {
         System.err.println("registering " + o + " from " + loader);
         LOADERS.add(new WeakReference<>(loader));
     }
+
     @Test public void loaderReleased() {
         logger.record(CpsFlowExecution.class, Level.FINER);
         story.addStep(new Statement() {
@@ -122,6 +132,94 @@ public class CpsFlowExecutionTest {
                 }
             }
         });
+    }
+
+    /**
+     * Measures the metaspace memory use, in bytes
+     * @return Bytes of metaspace used
+     */
+    static long getMetaSpaceUse() {
+        // Credit for this goes to http://stackoverflow.com/a/31010542/95122
+        for (MemoryPoolMXBean memoryMXBean : ManagementFactory.getMemoryPoolMXBeans()) {
+            if ("Metaspace".equals(memoryMXBean.getName())) {
+                return memoryMXBean.getUsage().getUsed();
+            }
+        }
+        return -1;
+    }
+
+    /** Return count of all currently loaded classes */
+    static int getLiveClassCount() {
+        ClassLoadingMXBean bean = ManagementFactory.getClassLoadingMXBean();
+        return bean.getLoadedClassCount();
+    }
+
+    @Test
+    public void testForMetaspaceLeakage() {
+        logger.record(CpsFlowExecution.class, Level.FINER);
+        story.addStep(new Statement() {
+              @Override
+              public void evaluate() throws Throwable {
+                  WorkflowJob p = story.j.jenkins.createProject(WorkflowJob.class, "leakableComplexGroovyBuild");
+                  p.setDefinition(new CpsFlowDefinition(
+                          " for (int i=0; i<3; i++) {\n" +
+                                  "    echo \"ran cycle $i\"        \n" +
+                                  "    node {\n" +
+                                  "        if (isUnix()) {\n" +
+                                  "            sh 'whoami';    \n" +
+                                  "        } else {\n" +
+                                  "            bat 'echo %USERNAME%'   \n" +
+                                  "        }\n" +
+                                  "    }\n" +
+                                  "}\n" +
+                                  "\n" +
+                                  "echo 'wait for executor'\n" +
+                                  "node {\n" +
+                                  "    for (int i=0; i<3; i++) {\n" +
+                                  "        echo \"we waited for this $i cycles\"    \n" +
+                                  "    }\n" +
+                                  "}\n", false));
+                  p.setBuildDiscarder(new LogRotator(1, 10));  // Avoids accumulating excess disk/memory use
+                  long initialMetaspace = getMetaSpaceUse();
+
+                  story.j.buildAndAssertSuccess(p);
+                  story.j.buildAndAssertSuccess(p);
+                  int buildCycles = 10;
+                  long baselineRunMetaspace = getMetaSpaceUse();
+                  int baselineClasses = getLiveClassCount();
+                  int lastClassSize = baselineClasses;
+                  for (int i = 0; i < buildCycles; i++) {
+                      story.j.buildAndAssertSuccess(p);
+                      System.gc();
+                      int classCount = getLiveClassCount();
+                      if (classCount > lastClassSize) {
+                          System.out.println("On build "+i+" we leaked "+(classCount-lastClassSize)+" classes!");
+                          lastClassSize = classCount;
+                      }
+                  }
+
+                  // TODO Create a class and force memory increases until it is GC'd, to force Metaspace cleanup
+
+                  System.gc();
+                  Thread.sleep(10000);
+                  System.gc();
+
+                  int finalClasses = getLiveClassCount();
+                  long afterRunMetaspace = getMetaSpaceUse();
+
+                  // Check for leaks -- note that we're adding a small margin for error to allow for GC that hasn't been runs
+                  // classes that haven't been cleaned yet.
+
+                  if (finalClasses > baselineClasses && (finalClasses-baselineClasses) > 30) {
+                      int classLeakSize = finalClasses-baselineClasses;
+                      Assert.fail("Over "+buildCycles+" builds we leaked : "+classLeakSize+" classes, or "+(classLeakSize/buildCycles)+" per build.");
+                  }
+                  if (afterRunMetaspace > baselineRunMetaspace && (baselineRunMetaspace-afterRunMetaspace) > 4*1024*1024*1024) {
+                      long leakSize = afterRunMetaspace-baselineRunMetaspace;
+                      Assert.fail("Over "+buildCycles+" builds we leaked : "+leakSize+" bytes of MetaSpace, or "+(leakSize/buildCycles)+" per build.");
+                  }
+              }
+          });
     }
 
     @Test public void getCurrentExecutions() {
