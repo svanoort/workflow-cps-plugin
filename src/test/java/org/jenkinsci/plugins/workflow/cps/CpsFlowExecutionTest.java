@@ -154,6 +154,79 @@ public class CpsFlowExecutionTest {
         return bean.getLoadedClassCount();
     }
 
+    static void forceFullFC() {
+        int size = 8192;
+        long[] arr = new long[size];
+        try {
+            while(true) {
+                if (arr.length < 1) {
+                    System.out.println("Forbidden condition triggered, was just here to ensure variable can't be optimized out.");
+                    break;
+                }
+                int newSize = (int)(size*1.5);
+                long[] tempArr = new long[newSize];
+                arr = tempArr;
+                size = newSize;
+            }
+        } catch (OutOfMemoryError oome) {
+            System.out.println("OutOfMemoryError triggered with array size: "+size);
+            //Exit loop, soft references collected!
+        }
+    }
+
+    @Test
+    public void testForTrivialMetaspaceLeakage() {
+        logger.record(CpsFlowExecution.class, Level.FINER);
+        story.addStep(new Statement() {
+            @Override
+            public void evaluate() throws Throwable {
+                WorkflowJob p = story.j.jenkins.createProject(WorkflowJob.class, "leakableSimpleGroovyBuild");
+                p.setDefinition(new CpsFlowDefinition(
+                        "echo 'ran things' ", false));
+                p.setBuildDiscarder(new LogRotator(1, 10));  // Avoids accumulating excess disk/memory use
+                long initialMetaspace = getMetaSpaceUse();
+
+                story.j.buildAndAssertSuccess(p);
+                story.j.buildAndAssertSuccess(p);
+                int buildCycles = 10;
+                long baselineRunMetaspace = getMetaSpaceUse();
+                int baselineClasses = getLiveClassCount();
+                int lastClassSize = baselineClasses;
+                for (int i = 0; i < buildCycles; i++) {
+                    story.j.buildAndAssertSuccess(p);
+                    System.gc();
+                    int classCount = getLiveClassCount();
+                    if (classCount > lastClassSize) {
+                        System.out.println("On build "+i+" we leaked "+(classCount-lastClassSize)+" classes!");
+                        lastClassSize = classCount;
+                    }
+                }
+
+                // TODO Create a class and force memory increases until it is GC'd, to force Metaspace cleanup
+
+                System.gc();
+                forceFullFC();
+                Thread.sleep(10000);
+                System.gc();
+
+                int finalClasses = getLiveClassCount();
+                long afterRunMetaspace = getMetaSpaceUse();
+
+                // Check for leaks -- note that we're adding a small margin for error to allow for GC that hasn't been runs
+                // classes that haven't been cleaned yet.
+
+                if (finalClasses > baselineClasses && (finalClasses-baselineClasses) > 30) {
+                    int classLeakSize = finalClasses-baselineClasses;
+                    Assert.fail("Over "+buildCycles+" builds we leaked : "+classLeakSize+" classes, or "+(classLeakSize/buildCycles)+" per build.");
+                }
+                if (afterRunMetaspace > baselineRunMetaspace && (baselineRunMetaspace-afterRunMetaspace) > 4*1024*1024*1024) {
+                    long leakSize = afterRunMetaspace-baselineRunMetaspace;
+                    Assert.fail("Over "+buildCycles+" builds we leaked : "+leakSize+" bytes of MetaSpace, or "+(leakSize/buildCycles)+" per build.");
+                }
+            }
+        });
+    }
+
     @Test
     public void testForMetaspaceLeakage() {
         logger.record(CpsFlowExecution.class, Level.FINER);
@@ -191,6 +264,7 @@ public class CpsFlowExecutionTest {
                   for (int i = 0; i < buildCycles; i++) {
                       story.j.buildAndAssertSuccess(p);
                       System.gc();
+                      Thread.sleep(3000);  // Allows for concurrent GC
                       int classCount = getLiveClassCount();
                       if (classCount > lastClassSize) {
                           System.out.println("On build "+i+" we leaked "+(classCount-lastClassSize)+" classes!");
@@ -201,6 +275,7 @@ public class CpsFlowExecutionTest {
                   // TODO Create a class and force memory increases until it is GC'd, to force Metaspace cleanup
 
                   System.gc();
+                  forceFullFC();
                   Thread.sleep(10000);
                   System.gc();
 
