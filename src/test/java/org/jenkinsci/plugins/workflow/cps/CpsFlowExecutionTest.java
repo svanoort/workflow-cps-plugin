@@ -48,6 +48,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.Vector;
 import java.util.logging.ConsoleHandler;
 import java.util.logging.Handler;
 import java.util.logging.Level;
@@ -59,6 +60,7 @@ import jenkins.model.BuildDiscarder;
 import jenkins.model.Jenkins;
 import org.codehaus.groovy.reflection.ClassInfo;
 import org.codehaus.groovy.transform.ASTTransformationVisitor;
+import org.eclipse.jetty.server.Server;
 import org.jenkinsci.plugins.scriptsecurity.sandbox.RejectedAccessException;
 import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.Whitelisted;
 import org.jenkinsci.plugins.workflow.flow.FlowExecution;
@@ -174,6 +176,35 @@ public class CpsFlowExecutionTest {
         }
     }
 
+    void checkForRetainedWebAppClasses() throws Exception {
+        JenkinsRule jr = story.j;
+        Field serverF = jr.getClass().getDeclaredField("server");
+        serverF.setAccessible(true);
+        Server s = (Server)(serverF.get(jr));
+        ClassLoader serverClassLoader = s.getClass().getClassLoader();
+
+        // TODO here you can attach a debugger to get the "classes" field of serverClassLoader and look for groovy internals
+        // (debugger Because it complains when you do this via normal reflection)
+
+        // Check for dangling ref
+        Class classInfoC = serverClassLoader.loadClass("org.codehaus.groovy.reflection.ClassInfo");
+        Field classInfoF = classInfoC.getDeclaredField("globalClassValue");
+        classInfoF.setAccessible(true);
+        Object globalClassValue = classInfoF.get(null);
+
+        // Check for dangling ref in the globalClassSet
+        Field globalClassSetF = classInfoC.getDeclaredField("globalClassSet");
+        globalClassSetF.setAccessible(true);
+        Object globalClassSet = globalClassSetF.get(null);
+
+        // Here you attach a debugger and go poking
+        /*for (Class c : classList) {
+            if (c.getName().contains("Script")) {
+                System.out.println("Retained script class: ");
+            }
+        }*/
+    }
+
     @Test
     public void testForTrivialMetaspaceLeakage() {
         logger.record(CpsFlowExecution.class, Level.FINER);
@@ -188,7 +219,7 @@ public class CpsFlowExecutionTest {
 
                 story.j.buildAndAssertSuccess(p);
                 story.j.buildAndAssertSuccess(p);
-                int buildCycles = 10;
+                int buildCycles = 5;
                 long baselineRunMetaspace = getMetaSpaceUse();
                 int baselineClasses = getLiveClassCount();
                 int lastClassSize = baselineClasses;
@@ -202,12 +233,12 @@ public class CpsFlowExecutionTest {
                     }
                 }
 
-                // TODO Create a class and force memory increases until it is GC'd, to force Metaspace cleanup
-
                 System.gc();
                 forceFullFC();
                 Thread.sleep(10000);
                 System.gc();
+
+                checkForRetainedWebAppClasses();
 
                 int finalClasses = getLiveClassCount();
                 long afterRunMetaspace = getMetaSpaceUse();
