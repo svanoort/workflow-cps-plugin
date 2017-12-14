@@ -52,12 +52,14 @@ import groovy.lang.GroovyShell;
 import hudson.ExtensionList;
 import hudson.model.Action;
 import hudson.model.Result;
+import hudson.model.queue.SubTask;
 import hudson.util.Iterators;
 import jenkins.model.CauseOfInterruption;
 import jenkins.model.Jenkins;
 import org.jboss.marshalling.Unmarshaller;
 import org.jenkinsci.plugins.workflow.actions.ErrorAction;
 import org.jenkinsci.plugins.workflow.cps.persistence.PersistIn;
+import org.jenkinsci.plugins.workflow.flow.BlockableResume;
 import org.jenkinsci.plugins.workflow.flow.FlowDurabilityHint;
 import org.jenkinsci.plugins.workflow.flow.FlowExecution;
 import org.jenkinsci.plugins.workflow.flow.FlowExecutionOwner;
@@ -229,7 +231,7 @@ import org.kohsuke.accmod.restrictions.DoNotUse;
  * @author Kohsuke Kawaguchi
  */
 @PersistIn(RUN)
-public class CpsFlowExecution extends FlowExecution {
+public class CpsFlowExecution extends FlowExecution implements BlockableResume {
     /**
      * Groovy script of the main source file (that the user enters in the GUI)
      */
@@ -332,16 +334,14 @@ public class CpsFlowExecution extends FlowExecution {
     /** Actions to add to the {@link FlowStartNode}. */
     transient final List<Action> flowStartNodeActions = new ArrayList<Action>();
 
-    /** If true, pipeline is forbidden to resume even if it can. */
+    @Override
     public boolean isResumeBlocked() {
         return resumeBlocked;
     }
 
-    public void setResumeBlocked(boolean resumeBlocked) {
-        if (this.resumeBlocked != resumeBlocked) {
-            this.resumeBlocked = resumeBlocked;
-            saveOwner();
-        }
+    @Override
+    public void setResumeBlocked(boolean b) {
+        resumeBlocked = b;
     }
 
     enum TimingKind {
@@ -654,7 +654,8 @@ public class CpsFlowExecution extends FlowExecution {
 
     /** If true, we are allowed to resume the build because resume is enabled AND we shut down cleanly. */
     public boolean canResume() {
-        if (isResumeBlocked()) {
+        FlowExecutionOwner myOwn = this.getOwner();
+        if (myOwn instanceof BlockableResume && ((BlockableResume)myOwn).isResumeBlocked()) {
             return false;
         }
         if (persistedClean != null) {
@@ -1396,6 +1397,7 @@ public class CpsFlowExecution extends FlowExecution {
             @Override public void onSuccess(CpsThreadGroup g) {
                 if (v) {
                     g.pause();
+                    checkResumeBlockedFromOwner();
                     saveOwner();
                     if (storage != null) {
                         try {
@@ -1719,6 +1721,29 @@ public class CpsFlowExecution extends FlowExecution {
         }
     }
 
+    /** Recheck the resume blocked status and fail the build if we're pausing/shutting down and couldn't resume after.
+     *  This makes it possible to do a cleaner shutdown.
+     *  @return True if we
+     */
+    private void checkResumeBlockedFromOwner() {
+        try {
+            FlowExecutionOwner owner = getOwner();
+            if (owner != null) {
+                Queue.Executable executable = owner.getExecutable();
+                if (executable == null ) {
+                    return;
+                }
+                SubTask st = executable.getParent();
+                if (st instanceof BlockableResume) {
+                    this.resumeBlocked = ((BlockableResume) st).isResumeBlocked();
+                }
+            }
+        } catch (IOException ioe) {
+            LOGGER.log(Level.WARNING, "Error fetching executable for FlowExecution", ioe);
+        }
+    }
+
+
     /** Ensures that even if we're limiting persistence of data for performance, we still write out data for shutdown. */
     @Override
     protected void notifyShutdown() {
@@ -1726,6 +1751,9 @@ public class CpsFlowExecution extends FlowExecution {
             // Nothing to persist OR we've already persisted it along the way.
             return;
         }
+
+        checkResumeBlockedFromOwner();
+
         FlowNodeStorage storage = getStorage();
         if (storage != null) {
             try {
