@@ -31,6 +31,7 @@ import com.gargoylesoftware.htmlunit.WebRequest;
 import com.google.common.util.concurrent.ListenableFuture;
 import groovy.lang.GroovyShell;
 import hudson.AbortException;
+import hudson.model.Hudson;
 import hudson.model.Item;
 import hudson.model.Result;
 import hudson.model.TaskListener;
@@ -61,6 +62,8 @@ import org.jenkinsci.plugins.workflow.support.pickles.SingleTypedPickleFactory;
 import org.jenkinsci.plugins.workflow.support.pickles.TryRepeatedly;
 import org.jenkinsci.plugins.workflow.test.steps.SemaphoreStep;
 import static org.junit.Assert.*;
+
+import org.junit.Assume;
 import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
@@ -237,6 +240,28 @@ public class CpsFlowExecutionTest {
                 WorkflowJob p = story.j.jenkins.getItemByFullName("p", WorkflowJob.class);
                 WorkflowRun b = p.getLastBuild();
                 story.j.assertLogContains("I am done", story.j.assertBuildStatusSuccess(story.j.waitForCompletion(b)));
+            }
+        });
+    }
+
+    @Issue("JENKINS-34256")
+    @Test
+    public void quietDown2() throws Exception {
+        Assume.assumeTrue("Needs posix to run", !Hudson.isWindows());
+        story.addStep(new Statement() {
+            @Override public void evaluate() throws Throwable {
+                WorkflowJob p = story.j.jenkins.createProject(WorkflowJob.class, "p");
+                p.setDefinition(new CpsFlowDefinition("" +
+                        "node{ sh 'for i in `seq 1 15`; do echo \"sleep $i\" && sleep 1; done'}", true));
+                WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+                Thread.sleep(5000);
+                story.j.jenkins.doQuietDown(false, 0);
+                ((CpsFlowExecution) b.getExecution()).waitForSuspension();
+                assertTrue(b.isBuilding());
+                story.j.jenkins.doCancelQuietDown();
+                // Should fail here but does not!
+                story.j.waitForCompletion(b);
+                story.j.assertBuildStatusSuccess(b);
             }
         });
     }
