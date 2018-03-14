@@ -702,7 +702,7 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
                         throw new IOException("Cannot resume build -- was not cleanly saved when Jenkins shut down.");
                     }
                 }
-            } catch (IOException e) {
+            } catch (Exception e) {
                 SettableFuture<CpsThreadGroup> p = SettableFuture.create();
                 programPromise = p;
                 loadProgramFailed(e, p);
