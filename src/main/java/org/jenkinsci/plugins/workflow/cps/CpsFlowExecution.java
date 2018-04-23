@@ -1722,6 +1722,91 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
      */
     static final ThreadLocal<CpsFlowExecution> PROGRAM_STATE_SERIALIZATION = new ThreadLocal<CpsFlowExecution>();
 
+
+    /** Listens for changes in persistable state that are invoked via callbacks. */
+    static interface PersistenceListener {
+        public void beforeMutateNodes();
+
+        public void afterMutateNodes();
+
+        public void beforeMutateExecution();
+
+        public void afterMutateExecution();
+
+        public void beforeMutateProgram();
+
+        public void afterMutateProgram();
+    }
+
+    /** Tracks persistence of state and ensures consistency and centralizes persistence logic so it's not scattered all over.
+     *  Able to be mocked out for testing to catch what is called and when, and acts as an intermediary for actual persistence calls.
+     *  This *also* enables us to simulate failures to persist data.
+     *
+     *  Note: how do we do error handling here?
+     *
+     *  May provide different impls for the different durability levels?
+     */
+    static class PersistenceController implements PersistenceListener {
+        CpsFlowExecution owner;
+
+        boolean executionChanged = false;
+        boolean nodesChanged = false;
+        boolean programChanged = false;
+
+        public boolean isUnflushed() {
+            return executionChanged || nodesChanged || programChanged;
+        }
+
+
+        // Below is a series of callbacks issued before and after we do state changes to apply persistence of state
+
+        public void beforeMutateNodes() {
+
+        }
+
+        public void afterMutateNodes() {
+
+        }
+
+        public void beforeMutateExecution() {
+
+        }
+
+        public void afterMutateExecution() {
+
+        }
+
+        public void beforeMutateProgram() {
+
+        }
+
+        public void afterMutateProgram() {
+
+        }
+
+        public void saveNodes() {
+            try {
+                owner.getStorage().flush();
+                nodesChanged = false;
+            } catch (IOException ioe) {
+
+            }
+        }
+
+        public void saveExecution() {
+            if (nodesChanged) {
+                saveNodes();
+            }
+        }
+
+        @CpsVmThreadOnly
+        public void saveProgram() {
+            if (executionChanged) {
+                saveExecution();
+            }
+        }
+    }
+
     class TimingFlowNodeStorage extends FlowNodeStorage {
         private final FlowNodeStorage delegate;
         TimingFlowNodeStorage(FlowNodeStorage delegate) {
