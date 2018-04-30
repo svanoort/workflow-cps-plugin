@@ -35,6 +35,7 @@ import com.cloudbees.groovy.cps.sandbox.SandboxInvoker;
 import com.cloudbees.jenkins.support.api.Component;
 import com.cloudbees.jenkins.support.api.Container;
 import com.cloudbees.jenkins.support.api.Content;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.FutureCallback;
@@ -231,6 +232,7 @@ import org.kohsuke.accmod.restrictions.DoNotUse;
  * @author Kohsuke Kawaguchi
  */
 @PersistIn(RUN)
+@SuppressFBWarnings(value = "IS_FIELD_NOT_GUARDED", justification = "temporary only")
 public class CpsFlowExecution extends FlowExecution implements BlockableResume {
     /**
      * Groovy script of the main source file (that the user enters in the GUI)
@@ -608,99 +610,89 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
         } else if (myHeads.size() == 0) {
             return "empty-heads";
         } else {
-            return myHeads.entrySet().stream().map(h->h.getKey()+"::"+h.getValue()).collect(Collectors.joining(","));
+            return myHeads.entrySet().stream().map(h -> h.getKey() + "::" + h.getValue()).collect(Collectors.joining(","));
         }
-
     }
 
-    /** Handle failures where we can't load heads. */
-    private void rebuildEmptyGraph() {
-        synchronized (this) {
-            this.done = Boolean.TRUE;  // Ensures that the flow does not show as incomplete if the graph data is corrupt
-            // something went catastrophically wrong and there's no live head. fake one
-            LOGGER.log(Level.WARNING, "Failed to load pipeline heads/start nodes, so faking some up for execution " + this.toString());
-            if (this.startNodes == null) {
-                this.startNodes = new Stack<BlockStartNode>();
-            }
+    /**
+     * In the event we're missing FlowNodes, fail-fast and create some mockup FlowNodes so we can continue.
+     * This avoids nulling out all of the execution's data
+     * Bypasses {@link #croak(Throwable)} and {@link #onProgramEnd(Outcome)} to guarantee a clean path.
+     */
+    @GuardedBy("this")
+    void createPlaceholderNodes(Throwable failureReason) throws Exception {
+        this.done = true;
 
-            if (this.heads == null) {
-                this.heads = new TreeMap<Integer,FlowHead>();
-            } else if (!this.heads.isEmpty()) {
-                if (LOGGER.isLoggable(Level.INFO)) {
-                    LOGGER.log(Level.INFO, "Resetting heads to rebuild the Pipeline structure, tossing existing heads: "+getHeadsAsString());
+        if (this.owner != null) {
+            Queue.Executable ex = owner.getExecutable();
+            if (ex instanceof Run) {
+                Result res = ((Run)ex).getResult();
+                setResult(res != null ? res : Result.FAILURE);
+            }
+        }
+
+        try {
+            programPromise = Futures.immediateFailedFuture(new IllegalStateException("Failed loading heads", failureReason));
+            LOGGER.log(Level.INFO, "Creating placeholder flownodes for execution: "+this);
+            if (this.owner != null) {
+                try {
+                    owner.getListener().getLogger().println("Creating placeholder flownodes because failed loading originals.");
+                } catch (Exception ex) {
+                    // It's okay to fail to log
                 }
-                this.heads.clear();
             }
 
-            this.startNodes.clear();
+            // Switch to fallback storage so we don't delete original node data
+            this.storageDir = (this.storageDir != null) ? this.storageDir+"-fallback" : "workflow-fallback";
+            this.storage = createStorage();  // Empty storage
+
+            // Clear out old start nodes and heads
+            this.startNodes = new Stack<BlockStartNode>();
             FlowHead head = new FlowHead(this);
+            this.heads = new TreeMap<Integer, FlowHead>();
             heads.put(head.getId(), head);
-            try {
-                FlowStartNode start = new FlowStartNode(this, iotaStr());
-                startNodes.push(start);
-                head.newStartNode(start);
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to persist", e);
-            }
-            persistedClean = false;
-            startNodesSerial = null;
-            headsSerial = null;
+            FlowStartNode start = new FlowStartNode(this, iotaStr());
+            head.newStartNode(start);
+
+            // Create end
+            FlowNode end = new FlowEndNode(this, iotaStr(), (FlowStartNode)startNodes.pop(), result, getCurrentHeads().toArray(new FlowNode[0]));
+            end.addAction(new ErrorAction(failureReason));
+            head.setNewHead(end);
+            saveOwner();
+
+        } catch (Exception ex) {
+            throw ex;
         }
     }
 
     @SuppressFBWarnings(value = "IS2_INCONSISTENT_SYNC", justification="Storage does not actually NEED to be synchronized but the rest does.")
     protected synchronized void initializeStorage() throws IOException {
-        boolean storageErrors = false;  // Maybe storage didn't get to persist properly or files were deleted.
-        try {
-            storage = createStorage();
+        storage = createStorage();
+        heads = new TreeMap<Integer,FlowHead>();
+        for (Map.Entry<Integer,String> entry : headsSerial.entrySet()) {
+            FlowHead h = new FlowHead(this, entry.getKey());
 
-                heads = new TreeMap<Integer,FlowHead>();
-                for (Map.Entry<Integer,String> entry : headsSerial.entrySet()) {
-                    FlowHead h = new FlowHead(this, entry.getKey());
-
-                    FlowNode n = storage.getNode(entry.getValue());
-                    if (n != null) {
-                        h.setForDeserialize(storage.getNode(entry.getValue()));
-                        heads.put(h.getId(), h);
-                    } else {
-                        LOGGER.log(Level.WARNING, "Tried to load head FlowNodes for execution "+this.owner+" but FlowNode was not found in storage for head id:FlowNodeId "+entry.getKey()+":"+entry.getValue());
-                        storageErrors = true;
-                        break;
-                    }
-                }
-
-            headsSerial = null;
-
-            if (!storageErrors) {
-                // Same for startNodes:
-                storageErrors = false;
-                startNodes = new Stack<BlockStartNode>();
-                for (String id : startNodesSerial) {
-                    FlowNode node = storage.getNode(id);
-                    if (node != null) {
-                        startNodes.add((BlockStartNode) storage.getNode(id));
-                    } else {
-                        // TODO if possible, consider trying to close out unterminated blocks using heads, to keep existing graph history
-                        LOGGER.log(Level.WARNING, "Tried to load startNode FlowNodes for execution "+this.owner+" but FlowNode was not found in storage for FlowNode Id "+id);
-                        storageErrors = true;
-                        break;
-                    }
-                }
+            FlowNode n = storage.getNode(entry.getValue());
+            if (n != null) {
+                h.setForDeserialize(storage.getNode(entry.getValue()));
+                heads.put(h.getId(), h);
+            } else {
+                throw new IOException("Tried to load head FlowNodes for execution "+this.owner+" but FlowNode was not found in storage for head id:FlowNodeId "+entry.getKey()+":"+entry.getValue());
             }
-            startNodesSerial = null;
-
-        } catch (Exception ioe) {
-            this.done = Boolean.TRUE;
-            LOGGER.log(Level.WARNING, "Error initializing storage and loading nodes for "+this, ioe);
-            storageErrors = true;
         }
+        headsSerial = null;
 
-        if (storageErrors) {  //
-            this.storageDir = (this.storageDir != null) ? this.storageDir+"-fallback" : "workflow-fallback";  // Avoid overwriting data
-            this.storage = createStorage();  // Empty storage
-            // Need to find a way to mimic up the heads and fail cleanly, far enough to let the canResume do its thing
-            rebuildEmptyGraph();
+        startNodes = new Stack<BlockStartNode>();
+        for (String id : startNodesSerial) {
+            FlowNode node = storage.getNode(id);
+            if (node != null) {
+                startNodes.add((BlockStartNode) storage.getNode(id));
+            } else {
+                // TODO if possible, consider trying to close out unterminated blocks using heads, to keep existing graph history
+                throw  new IOException( "Tried to load startNode FlowNodes for execution "+this.owner+" but FlowNode was not found in storage for FlowNode Id "+id);
+            }
         }
+        startNodesSerial = null;
     }
 
     /** If true, we are allowed to resume the build because resume is enabled AND we shut down cleanly. */
@@ -719,38 +711,45 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
     @SuppressFBWarnings(value = "RC_REF_COMPARISON_BAD_PRACTICE_BOOLEAN", justification = "We want to explicitly check for boolean not-null and true")
     public void onLoad(FlowExecutionOwner owner) throws IOException {
         this.owner = owner;
-        try {
-            initializeStorage();
-            if (heads == null) {
-                LOGGER.log(Level.WARNING, "Null Flow heads after initializing storage for FlowExecution "+this);
-            } else if (heads.isEmpty()) {
-                LOGGER.log(Level.INFO, "Empty flow heads after initializing storage - not necessarily an error, but odd - for FlowExecution "+this);
-            }
-            if (startNodes == null) {
-                LOGGER.log(Level.WARNING, "Null block start nodes after initializing storage for FlowExecution "+this);
-            } else if (startNodes.isEmpty()) {
-                LOGGER.log(Level.INFO, "Empty block start nodes after initializing storage - not necessarily an error, but odd - for FlowExecution "+this);
-            }
 
+        try {
             try {
-                if (!isComplete()) {
-                    // FOR SOME REASON we're arriving here even for *completed* builds sometimes, hopefully logging above helps
-                    if (canResume()) {
-                        loadProgramAsync(getProgramDataFile());
-                    } else {
-                        // TODO if possible, consider trying to close out unterminated blocks to keep existing graph history
-                        // That way we can visualize the graph in some error cases.
-                        LOGGER.log(Level.WARNING, "Pipeline state not properly persisted, cannot resume "+owner.getUrl());
-                        throw new IOException("Cannot resume build -- was not cleanly saved when Jenkins shut down.");
-                    }
-                } else if (done && !super.isComplete()) {
+                initializeStorage();  // Throws exception and bombs out if we can't load FlowNodes
+            } catch (Exception ex) {
+                LOGGER.log(Level.WARNING, "Error initializing storage and loading nodes, will try to create placeholders for: "+this, ex);
+                createPlaceholderNodes(ex);
+                return;
+            }
+        } catch (Exception ex) {
+            done = true;
+            programPromise = Futures.immediateFailedFuture(ex);
+            throw new IOException("Failed to even create placeholder nodes for execution", ex);
+        }
+
+        try {
+            if (isComplete()) {
+                if (done == Boolean.TRUE && !super.isComplete()) {
                     LOGGER.log(Level.WARNING, "Completed flow without FlowEndNode: "+this+" heads:"+getHeadsAsString());
                 }
-            } catch (Exception e) {  // Multicatch ensures that failure to load does not nuke the master
-                SettableFuture<CpsThreadGroup> p = SettableFuture.create();
-                programPromise = p;
-                loadProgramFailed(e, p);
+                if (super.isComplete() && done != Boolean.TRUE) {
+                    LOGGER.log(Level.WARNING, "Flow has FlowEndNode, but is not marked as done, fixing this for"+this);
+                    done = true;
+                    saveOwner();
+                }
+            } else {  // See if we can/should resume build
+                if (canResume()) {
+                    loadProgramAsync(getProgramDataFile());
+                } else {
+                    // TODO if possible, consider trying to close out unterminated blocks to keep existing graph history
+                    // That way we can visualize the graph in some error cases.
+                    LOGGER.log(Level.WARNING, "Pipeline state not properly persisted, cannot resume "+owner.getUrl());
+                    throw new IOException("Cannot resume build -- was not cleanly saved when Jenkins shut down.");
+                }
             }
+        } catch (Exception e) {  // Multicatch ensures that failure to load does not nuke the master
+            SettableFuture<CpsThreadGroup> p = SettableFuture.create();
+            programPromise = p;
+            loadProgramFailed(e, p);
         } finally {
             if (programPromise == null) {
                 programPromise = Futures.immediateFailedFuture(new IllegalStateException("completed or broken execution"));
@@ -921,15 +920,19 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
         });
     }
 
+    /** See JENKINS-22941 for why this exists. */
     @Override public boolean blocksRestart() {
         if (programPromise == null || !programPromise.isDone()) {
+            // Can't restart cleanly while trying to set up the build
             return true;
         }
         CpsThreadGroup g;
         try {
             g = programPromise.get();
         } catch (Exception x) {
-            return true;
+            // FIXME check this won't cause issues due to depickling delays etc
+            LOGGER.log(Level.FINE, "Not blocking restart due to exception in ProgramPromise: "+this, x);
+            return false;
         }
         return g.busy;
     }
@@ -1225,9 +1228,10 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
         // shrink everything into a single new head
         try {
             if (heads != null) {
+                // Below does not look correct to me
                 FlowHead first = getFirstHead();
                 first.setNewHead(head);
-                done = Boolean.TRUE;  // After setting the final head
+                done = true;  // After setting the final head
                 heads.clear();
                 heads.put(first.getId(), first);
 
@@ -1239,8 +1243,8 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
                 }
             }
         } catch (Exception ex) {
-            done = Boolean.TRUE;
-            throw ex;
+            done = true;
+            LOGGER.log(Level.WARNING, "Error trying to end execution "+this, ex);
         }
 
         try {
@@ -1248,6 +1252,9 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
         } catch (IOException ioe) {
             LOGGER.log(Level.WARNING, "Error flushing FlowNodeStorage to disk at end of run", ioe);
         }
+
+        this.persistedClean = Boolean.TRUE;
+        saveOwner();
     }
 
     void cleanUpHeap() {
@@ -1468,6 +1475,13 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
         return shell.generateScriptName().replaceFirst("[.]groovy$", "");
     }
 
+    /** Has the execution been marked done - note that legacy builds may not have that flag persisted, in which case
+     *  we look for a single FlowEndNode head (see: {@link #isComplete()} and {@link FlowExecution#isComplete()})
+     */
+    public boolean isDoneFlagSet() {
+        return done;
+    }
+
     public boolean isPaused() {
         if (programPromise.isDone()) {
             try {
@@ -1495,7 +1509,7 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
         if (executable instanceof AccessControlled) {
             ((AccessControlled) executable).checkPermission(Item.CANCEL);
         }
-        done = Boolean.FALSE;
+        done = false;
         Futures.addCallback(programPromise, new FutureCallback<CpsThreadGroup>() {
             @Override public void onSuccess(CpsThreadGroup g) {
                 if (v) {
@@ -1527,23 +1541,27 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
         try (Timeout t = Timeout.limit(3, TimeUnit.MINUTES)) { // TODO some complicated sequence of calls to Futures could allow all of them to run in parallel
             LOGGER.fine("starting to suspend all executions");
             for (FlowExecution execution : FlowExecutionList.get()) {
-                if (execution instanceof CpsFlowExecution) {
-                    CpsFlowExecution cpsExec = (CpsFlowExecution)execution;
-                    cpsExec.checkAndAbortNonresumableBuild();
+                try {
+                    if (execution instanceof CpsFlowExecution) {
+                        CpsFlowExecution cpsExec = (CpsFlowExecution)execution;
+                        cpsExec.checkAndAbortNonresumableBuild();
 
-                    LOGGER.log(Level.FINE, "waiting to suspend {0}", execution);
-                    exec = (CpsFlowExecution) execution;
-                    // Like waitForSuspension but with a timeout:
-                    if (exec.programPromise != null) {
-                        LOGGER.log(Level.FINER, "Waiting for Pipeline to go to sleep for shutdown: "+execution);
-                        try {
-                            exec.programPromise.get(1, TimeUnit.MINUTES).scheduleRun().get(1, TimeUnit.MINUTES);
-                            LOGGER.log(Level.FINER, " Pipeline went to sleep OK: "+execution);
-                        } catch (InterruptedException | TimeoutException ex) {
-                            LOGGER.log(Level.WARNING, "Error waiting for Pipeline to suspend: "+exec, ex);
+                        LOGGER.log(Level.FINE, "waiting to suspend {0}", execution);
+                        exec = (CpsFlowExecution) execution;
+                        // Like waitForSuspension but with a timeout:
+                        if (exec.programPromise != null) {
+                            LOGGER.log(Level.FINER, "Waiting for Pipeline to go to sleep for shutdown: "+execution);
+                            try {
+                                exec.programPromise.get(1, TimeUnit.MINUTES).scheduleRun().get(1, TimeUnit.MINUTES);
+                                LOGGER.log(Level.FINER, " Pipeline went to sleep OK: "+execution);
+                            } catch (InterruptedException | TimeoutException ex) {
+                                LOGGER.log(Level.WARNING, "Error waiting for Pipeline to suspend: "+exec, ex);
+                            }
                         }
+                        cpsExec.checkpoint();
                     }
-                    cpsExec.checkpoint();
+                } catch (Exception ex) {
+                    LOGGER.log(Level.WARNING, "Error persisting Pipeline execution at shutdown: "+((CpsFlowExecution) execution).owner, ex);
                 }
             }
             LOGGER.fine("finished suspending all executions");
@@ -1960,12 +1978,15 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
             // Try to ensure we've saved the appropriate things -- the program is the last stumbling block.
             try {
                 final SettableFuture<Void> myOutcome = SettableFuture.create();
+                LOGGER.log(Level.INFO, "About to try to checkpoint the program for build"+this);
                 if (programPromise != null && programPromise.isDone()) {
                     runInCpsVmThread(new FutureCallback<CpsThreadGroup>() {
                         @Override
                         public void onSuccess(CpsThreadGroup result) {
                             try {
+                                LOGGER.log(Level.INFO, "Trying to save program before shutdown "+this);
                                 result.saveProgramIfPossible(true);
+                                LOGGER.log(Level.INFO, "Finished saving program before shutdown "+this);
                                 myOutcome.set(null);
                             } catch (Exception ex) {
                                 LOGGER.log(Level.WARNING, "Error persisting program: "+ex);
@@ -1975,10 +1996,12 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
 
                         @Override
                         public void onFailure(Throwable t) {
+                            LOGGER.log(Level.WARNING, "Failed trying to save program before shutdown "+this);
                             myOutcome.setException(t);
                         }
                     });
                     myOutcome.get(30, TimeUnit.SECONDS);
+                    LOGGER.log(Level.FINE, "Successfully saved program for "+this);
                 }
 
             } catch (TimeoutException te) {
@@ -1990,12 +2013,18 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
             }
             try { // Flush node storage just in case the Program mutated it, just to be sure
                 storage.flush();
+                LOGGER.log(Level.FINE, "Successfully did final flush of storage for "+this);
             } catch (IOException ioe) {
                 persistOk=false;
                 LOGGER.log(Level.WARNING, "Error persisting FlowNode storage before shutdown", ioe);
             }
             persistedClean = persistOk;
-            saveOwner();
+            try {
+                saveOwner();
+            } catch (Exception ex) {
+                LOGGER.log(Level.WARNING, "Error saving build for "+this, ex);
+            }
+
         }
     }
 
