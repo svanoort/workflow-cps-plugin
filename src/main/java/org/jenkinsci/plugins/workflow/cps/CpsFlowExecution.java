@@ -35,7 +35,6 @@ import com.cloudbees.groovy.cps.sandbox.SandboxInvoker;
 import com.cloudbees.jenkins.support.api.Component;
 import com.cloudbees.jenkins.support.api.Container;
 import com.cloudbees.jenkins.support.api.Content;
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.FutureCallback;
@@ -340,6 +339,8 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
 
     /** Actions to add to the {@link FlowStartNode}. */
     transient final List<Action> flowStartNodeActions = new ArrayList<Action>();
+
+    private transient PersistenceController persistenceController = new PersistenceController(this);
 
     /** If true, pipeline is forbidden to resume even if it can. */
     public boolean isResumeBlocked() {
@@ -1648,6 +1649,7 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
                         result = (CpsFlowExecution) ref.newInstance(CpsFlowExecution.class);
                     }
 
+                    result.persistenceController = new PersistenceController(result);
                     result.startNodesSerial = new ArrayList<String>();
                     result.headsSerial = new TreeMap<Integer, String>();
 
@@ -1756,6 +1758,11 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
         public void afterMutateProgram();
     }
 
+    @Restricted(NoExternalUse.class)
+    public PersistenceController getPersistenceController() {
+        return this.persistenceController;
+    }
+
     /** Tracks persistence of state and ensures consistency and centralizes persistence logic so it's not scattered all over.
      *  Able to be mocked out for testing to catch what is called and when, and acts as an intermediary for actual persistence calls.
      *  This *also* enables us to simulate failures to persist data.
@@ -1765,11 +1772,15 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
      *  May provide different impls for the different durability levels?
      */
     static class PersistenceController implements PersistenceListener {
-        CpsFlowExecution owner;
+        CpsFlowExecution execution;
 
         boolean executionChanged = false;
         boolean nodesChanged = false;
         boolean programChanged = false;
+
+        public PersistenceController(CpsFlowExecution exec) {
+            this.execution = exec;
+        }
 
         public boolean isUnflushed() {
             return executionChanged || nodesChanged || programChanged;
@@ -1804,7 +1815,7 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
 
         public void saveNodes() {
             try {
-                owner.getStorage().flush();
+                execution.getStorage().flush();
                 nodesChanged = false;
             } catch (IOException ioe) {
 
