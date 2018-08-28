@@ -64,6 +64,7 @@ public class CpsFlowExecutionMemoryTest {
         LOADERS.add(new WeakReference<>(loader));
     }
 
+    @Ignore
     @Test public void loaderReleased() throws Exception {
         WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
         r.jenkins.getWorkspaceFor(p).child("lib.groovy").write(CpsFlowExecutionMemoryTest.class.getName() + ".register(this)", null);

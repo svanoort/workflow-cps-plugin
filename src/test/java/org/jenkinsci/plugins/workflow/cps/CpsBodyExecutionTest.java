@@ -10,7 +10,6 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import javax.annotation.Nonnull;
 import org.codehaus.groovy.runtime.ScriptBytecodeAdapter;
 import org.hamcrest.Matchers;
 import org.jenkinsci.plugins.workflow.actions.ErrorAction;

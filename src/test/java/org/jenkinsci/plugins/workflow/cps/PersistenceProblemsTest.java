@@ -245,7 +245,6 @@ public class PersistenceProblemsTest {
     }
 
     @Test
-    @Ignore
     public void inProgressMaxPerfCleanShutdown() throws Exception {
         final int[] build = new int[1];
         story.then( j -> {
@@ -265,7 +264,6 @@ public class PersistenceProblemsTest {
     }
 
     @Test
-    @Ignore
     public void inProgressMaxPerfDirtyShutdown() throws Exception {
         final int[] build = new int[1];
         final String[] finalNodeId = new String[1];

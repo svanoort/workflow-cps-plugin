@@ -37,6 +37,7 @@ import hudson.model.Result;
 import jenkins.model.Jenkins;
 import org.jenkinsci.plugins.workflow.actions.ErrorAction;
 import org.jenkinsci.plugins.workflow.cps.persistence.PersistIn;
+import org.jenkinsci.plugins.workflow.graph.FlowEndNode;
 import org.jenkinsci.plugins.workflow.graph.FlowNode;
 import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException;
 import org.jenkinsci.plugins.workflow.support.pickles.serialization.RiverWriter;
@@ -396,6 +397,9 @@ public final class CpsThreadGroup implements Serializable {
      */
     @CpsVmThreadOnly
     /*package*/ void notifyNewHead(final FlowNode head) {
+        if (head instanceof FlowEndNode) {
+            LOGGER.log(Level.SEVERE, "Notifying for FlowEndNode");
+        }
         assertVmThread();
         execution.notifyListeners(Collections.singletonList(head), true);
         synchronized (nodesToNotifyLock) {

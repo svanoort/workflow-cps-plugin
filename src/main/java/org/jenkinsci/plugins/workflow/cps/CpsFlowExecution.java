@@ -621,6 +621,7 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
      */
     @GuardedBy("this")
     void createPlaceholderNodes(Throwable failureReason) throws Exception {
+        System.out.println("Creating placeholder nodes");
         synchronized (this) {
             this.done = true;
 
@@ -1222,6 +1223,7 @@ public class CpsFlowExecution extends FlowExecution implements BlockableResume {
      * @param outcome success; or a normal failure (uncaught exception); or a fatal error in VM machinery
      */
     synchronized void onProgramEnd(Outcome outcome) {
+        System.out.println("Called onProgramEnd");
         FlowNode head = new FlowEndNode(this, iotaStr(), (FlowStartNode)startNodes.pop(), result, getCurrentHeads().toArray(new FlowNode[0]));
         if (outcome.isFailure()) {
             head.addAction(new ErrorAction(outcome.getAbnormal()));

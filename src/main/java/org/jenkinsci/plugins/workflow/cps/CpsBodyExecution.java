@@ -145,7 +145,7 @@ class CpsBodyExecution extends BodyExecution {
             // let the new CpsThread run. Either get the new thread going normally with (null,null), or abort from the beginning
             // due to earlier cancellation
             synchronized (this) {
-                t.resume(new Outcome(null, stopped));
+                t.resume(new Outcome(   null, stopped));
                 assert this.thread==null;
                 this.thread = t;
             }
