@@ -291,8 +291,12 @@ public class ArgumentsActionImpl extends ArgumentsAction {
         } else if (tempVal instanceof UninstantiatedDescribable) {
             tempVal = ((UninstantiatedDescribable)tempVal).toMap();
         } else if (tempVal instanceof Describable) {  // Raw Describables may not be safe to store, so we should explode it
-            m = DescribableModel.of(tempVal.getClass());
-            tempVal = m.uninstantiate2(o).toMap();
+            try {
+                m = DescribableModel.of(tempVal.getClass());
+                tempVal = m.uninstantiate2(o).toMap();
+            } catch (Exception ex) {  // Catches issues due to some special-purpose Describable types that cannot have models generated.
+                return NotStoredReason.UNSERIALIZABLE;
+            }
         }
 
         if (isOversized(tempVal)) {
@@ -324,26 +328,31 @@ public class ArgumentsActionImpl extends ArgumentsAction {
             return NotStoredReason.MASKED_VALUE;
         }
 
-        if (modded != tempVal) {
-            // Sanitization stripped out some values, so we need to record that and return modified version
-            this.isUnmodifiedBySanitization = false;
-            if (o instanceof Describable && !(o instanceof Step)) { // Return an UninstantiatedDescribable for the input Describable with masking applied to arguments
-                // We're skipping steps because for those we want to return the raw arguments anyway...
+        try {
+            if (modded != tempVal) {
+                // Sanitization stripped out some values, so we need to record that and return modified version
+                this.isUnmodifiedBySanitization = false;
+                if (o instanceof Describable && !(o instanceof Step)) { // Return an UninstantiatedDescribable for the input Describable with masking applied to arguments
+                    // We're skipping steps because for those we want to return the raw arguments anyway...
+                    UninstantiatedDescribable rawUd = m.uninstantiate2(o);
+                    return new UninstantiatedDescribable(rawUd.getSymbol(), rawUd.getKlass(), (Map<String, ?>) modded);
+                } else if (o instanceof UninstantiatedDescribable) {
+                    // Need to retain the symbol.
+                    UninstantiatedDescribable ud = (UninstantiatedDescribable) o;
+                    return new UninstantiatedDescribable(ud.getSymbol(), ud.getKlass(), (Map<String, ?>) modded);
+                } else {
+                    return modded;
+                }
+            } else if (o instanceof Describable && tempVal instanceof Map) {  // Handle oddball cases where Describable is passed in directly and we need to uninstantiate.
                 UninstantiatedDescribable rawUd = m.uninstantiate2(o);
-                return new UninstantiatedDescribable(rawUd.getSymbol(), rawUd.getKlass(), (Map<String, ?>) modded);
-            } else if (o instanceof UninstantiatedDescribable) {
-                // Need to retain the symbol.
-                UninstantiatedDescribable ud = (UninstantiatedDescribable) o;
-                return new UninstantiatedDescribable(ud.getSymbol(), ud.getKlass(), (Map<String, ?>) modded);
-            } else {
-                return modded;
+                return rawUd;
+            } else {  // Any mutation was just from exploding step/uninstantiated describable, and we can just use the original
+                return o;
             }
-        } else if (o instanceof Describable && tempVal instanceof Map) {  // Handle oddball cases where Describable is passed in directly and we need to uninstantiate.
-            UninstantiatedDescribable rawUd = m.uninstantiate2(o);
-            return rawUd;
-        } else {  // Any mutation was just from exploding step/uninstantiated describable, and we can just use the original
-            return o;
+        } catch (Exception ex) {  // Error in one of the UninstantiatedDescribable operations
+            return NotStoredReason.UNSERIALIZABLE;
         }
+
     }
 
     /** Verify that all the arguments WILL serialize and if not replace with {@link org.jenkinsci.plugins.workflow.actions.ArgumentsAction.NotStoredReason#UNSERIALIZABLE}
